@@ -28,6 +28,7 @@ class QuestionStatus(str, Enum):
     ANSWERED_PRIVATE = "answered_private"  # Answered privately only
     ANSWERED_PUBLIC = "answered_public"  # Posted to channel
     REJECTED = "rejected"  # Rejected/invalid
+    SELF_ANSWERED = "self_answered"  # User found answer via search
 
 
 # Association table for post tags
@@ -127,3 +128,14 @@ class Tag(Base):
 
     # Relationships
     posts: Mapped[List["ChannelPost"]] = relationship("ChannelPost", secondary=post_tags, back_populates="tags")
+
+
+class SelfAnsweredLog(Base):
+    """Log of users who found answers via search (self-answered)"""
+    __tablename__ = "self_answered_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    question_preview: Mapped[str] = mapped_column(Text, nullable=False)  # User's question that they found answer for
+    found_post_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # Which post they viewed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

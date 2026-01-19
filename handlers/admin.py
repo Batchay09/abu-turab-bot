@@ -238,11 +238,14 @@ async def view_question_detail(callback: CallbackQuery, callback_data: AdminQueu
         QuestionStatus.REJECTED: "❌ Отклонён",
     }
 
-    username = f"@{question.user.username}" if question.user.username else "Без юзернейма"
+    # Count user's questions for context
+    async with async_session() as session:
+        user_questions = await QuestionService.get_user_questions(session, question.user_id, limit=100)
+    user_question_count = len(user_questions)
 
     text = Messages.QUESTION_DETAIL.format(
         question_id=question.id,
-        username=username,
+        username=f"ID:{question.user_id} ({user_question_count} вопр.)",
         date=question.created_at.strftime("%d.%m.%Y %H:%M"),
         status=status_names.get(question.status, "Неизвестно"),
         question_text=question.question_text
@@ -259,13 +262,14 @@ async def view_question_detail(callback: CallbackQuery, callback_data: AdminQueu
             text="❌ Отклонить",
             callback_data=AdminAnswerCallback(action="reject", question_id=question.id).pack()
         )
+        keyboard.adjust(2)
 
-        if question.status == QuestionStatus.PENDING:
-            keyboard.button(
-                text="👤 Взять себе",
-                callback_data=AdminQueueCallback(action="assign", question_id=question.id).pack()
-            )
-        keyboard.adjust(2, 1)
+    # Button to view user's question history
+    if user_question_count > 1:
+        keyboard.button(
+            text=f"📋 История ({user_question_count})",
+            callback_data=AdminQueueCallback(action="user_history", question_id=question.user_id).pack()
+        )
 
     keyboard.button(text="🔙 Назад", callback_data="admin_panel")
     keyboard.adjust(1)
@@ -274,26 +278,46 @@ async def view_question_detail(callback: CallbackQuery, callback_data: AdminQueu
     await callback.answer()
 
 
-@admin_router.callback_query(AdminQueueCallback.filter(F.action == "assign"))
-async def assign_question(callback: CallbackQuery, callback_data: AdminQueueCallback, state: FSMContext):
-    """Assign question to current admin"""
+@admin_router.callback_query(AdminQueueCallback.filter(F.action == "user_history"))
+async def view_user_history(callback: CallbackQuery, callback_data: AdminQueueCallback, state: FSMContext):
+    """View question history for a specific user"""
     if not await is_admin(callback.from_user.id):
         await callback.answer(Messages.ERROR_NOT_ADMIN, show_alert=True)
         return
 
-    async with async_session() as session:
-        question = await QuestionService.assign_to_admin(
-            session=session,
-            question_id=callback_data.question_id,
-            admin_id=callback.from_user.id
-        )
+    user_id = callback_data.question_id  # Reusing question_id field for user_id
 
-    if question:
-        await callback.answer("Вопрос назначен вам", show_alert=True)
-        # Refresh view
-        await view_question_detail(callback, callback_data, state)
-    else:
-        await callback.answer("Ошибка назначения", show_alert=True)
+    async with async_session() as session:
+        questions = await QuestionService.get_user_questions(session, user_id, limit=20)
+
+    if not questions:
+        await callback.answer("История пуста", show_alert=True)
+        return
+
+    # Format status icons
+    status_icons = {
+        QuestionStatus.PENDING: "⏳",
+        QuestionStatus.IN_PROGRESS: "✍️",
+        QuestionStatus.ANSWERED_PUBLIC: "📢",
+        QuestionStatus.ANSWERED_PRIVATE: "✉️",
+        QuestionStatus.REJECTED: "❌",
+    }
+
+    text = f"📋 История вопросов ID:{user_id}\n\n"
+
+    for q in questions[:10]:  # Show last 10
+        icon = status_icons.get(q.status, "❓")
+        date = q.created_at.strftime("%d.%m")
+        preview = q.question_text[:50].replace("\n", " ")
+        if len(q.question_text) > 50:
+            preview += "..."
+        text += f"{icon} [{date}] {preview}\n\n"
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔙 Назад", callback_data="admin_panel")
+
+    await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+    await callback.answer()
 
 
 @admin_router.callback_query(AdminAnswerCallback.filter(F.action == "answer"))
@@ -549,15 +573,15 @@ async def tags_done(callback: CallbackQuery, state: FSMContext):
 
     keyboard = InlineKeyboardBuilder()
     keyboard.button(
-        text="📩 Только в личку (анонимно)",
-        callback_data=AdminDestCallback(action="private").pack()
-    )
-    keyboard.button(
-        text="📢 В канал + личку",
+        text="📢 В пост",
         callback_data=AdminDestCallback(action="channel").pack()
     )
+    keyboard.button(
+        text="📩 В личку",
+        callback_data=AdminDestCallback(action="private").pack()
+    )
     keyboard.button(text="🔙 Назад к тегам", callback_data="back_to_tags")
-    keyboard.adjust(1)
+    keyboard.adjust(2, 1)
 
     await callback.message.edit_text(
         Messages.CHOOSE_DESTINATION,
@@ -672,15 +696,15 @@ async def back_to_destination(callback: CallbackQuery, state: FSMContext):
 
     keyboard = InlineKeyboardBuilder()
     keyboard.button(
-        text="📩 Только в личку (анонимно)",
-        callback_data=AdminDestCallback(action="private").pack()
-    )
-    keyboard.button(
-        text="📢 В канал + личку",
+        text="📢 В пост",
         callback_data=AdminDestCallback(action="channel").pack()
     )
+    keyboard.button(
+        text="📩 В личку",
+        callback_data=AdminDestCallback(action="private").pack()
+    )
     keyboard.button(text="🔙 Назад к тегам", callback_data="back_to_tags")
-    keyboard.adjust(1)
+    keyboard.adjust(2, 1)
 
     await callback.message.edit_text(
         Messages.CHOOSE_DESTINATION,
@@ -770,13 +794,12 @@ async def publish_post(callback: CallbackQuery, state: FSMContext, bot: Bot):
         # Get post URL
         post_url = channel_service.get_post_url(channel_post.message_id)
 
-        # Send notification to user (both answer AND channel link)
+        # Send notification to user (only link, no answer text)
         try:
             await bot.send_message(
                 chat_id=question.user_id,
                 text=Messages.ANSWER_RECEIVED_PUBLIC.format(
                     question=question_text,
-                    answer=answer_text,
                     post_url=post_url
                 )
             )

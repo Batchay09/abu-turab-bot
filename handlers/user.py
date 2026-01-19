@@ -154,6 +154,9 @@ async def view_similar(callback: CallbackQuery, callback_data: SimilarCallback, 
         await callback.answer("Ответ не найден", show_alert=True)
         return
 
+    # Store last viewed post_id for self-answered logging
+    await state.update_data(last_viewed_post_id=post_id)
+
     # Format answer preview
     answer_preview = doc["answer_text"]
     if len(answer_preview) > 500:
@@ -176,7 +179,7 @@ async def view_similar(callback: CallbackQuery, callback_data: SimilarCallback, 
 
     keyboard.button(
         text="✅ Ответ найден",
-        callback_data="cancel"
+        callback_data=SimilarCallback(action="found", post_id=post_id).pack()
     )
     keyboard.button(
         text="🔙 Назад к списку",
@@ -189,6 +192,40 @@ async def view_similar(callback: CallbackQuery, callback_data: SimilarCallback, 
     keyboard.adjust(1)
 
     await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
+    await callback.answer()
+
+
+@user_router.callback_query(SimilarCallback.filter(F.action == "found"))
+async def self_answered(callback: CallbackQuery, callback_data: SimilarCallback, state: FSMContext):
+    """User found their answer via search - log it and show success"""
+    data = await state.get_data()
+    question_text = data.get("pending_question", "")
+    found_post_id = callback_data.post_id
+
+    # Log the self-answered event
+    if question_text:
+        async with async_session() as session:
+            await QuestionService.log_self_answered(
+                session=session,
+                user_id=callback.from_user.id,
+                question_preview=question_text,
+                found_post_id=found_post_id
+            )
+
+    # Clear state
+    await state.clear()
+
+    # Show success message with menu
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="❓ Задать другой вопрос", callback_data="ask_question")
+    keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
+    keyboard.adjust(1)
+
+    await callback.message.edit_text(
+        "✅ Отлично! Рады, что вы нашли ответ на свой вопрос.\n\n"
+        "Если у вас есть другие вопросы — мы всегда готовы помочь!",
+        reply_markup=keyboard.as_markup()
+    )
     await callback.answer()
 
 
@@ -325,21 +362,22 @@ async def my_questions(event: Message | CallbackQuery, state: FSMContext):
             limit=50  # Get more for counting
         )
 
-    if not questions:
+    # Filter out rejected questions - users should not see them (security)
+    visible_questions = [q for q in questions if q.status != QuestionStatus.REJECTED]
+
+    if not visible_questions:
         text = Messages.NO_QUESTIONS
         keyboard = InlineKeyboardBuilder()
         keyboard.button(text="❓ Задать вопрос", callback_data="ask_question")
         keyboard.button(text="🏠 Главное меню", callback_data="main_menu")
         keyboard.adjust(1)
     else:
-        # Count by status
-        pending_count = sum(1 for q in questions if q.status in [QuestionStatus.PENDING, QuestionStatus.IN_PROGRESS])
-        answered_count = sum(1 for q in questions if q.status in [QuestionStatus.ANSWERED_PUBLIC, QuestionStatus.ANSWERED_PRIVATE])
-        rejected_count = sum(1 for q in questions if q.status == QuestionStatus.REJECTED)
+        # Count by status (excluding rejected)
+        pending_count = sum(1 for q in visible_questions if q.status in [QuestionStatus.PENDING, QuestionStatus.IN_PROGRESS])
 
         text = f"""📋 Мои вопросы
 
-Всего вопросов: {len(questions)}
+Всего вопросов: {len(visible_questions)}
 
 Выберите папку:"""
 
@@ -350,19 +388,24 @@ async def my_questions(event: Message | CallbackQuery, state: FSMContext):
                 text=f"⏳ Ожидают ответа ({pending_count})",
                 callback_data=MyQuestionsCallback(action="folder", folder="pending").pack()
             )
-        if answered_count > 0:
+        # Split answered into private and public
+        private_count = sum(1 for q in visible_questions if q.status == QuestionStatus.ANSWERED_PRIVATE)
+        public_count = sum(1 for q in visible_questions if q.status == QuestionStatus.ANSWERED_PUBLIC)
+
+        if private_count > 0:
             keyboard.button(
-                text=f"✅ Отвеченные ({answered_count})",
-                callback_data=MyQuestionsCallback(action="folder", folder="answered").pack()
+                text=f"✉️ Личные ответы ({private_count})",
+                callback_data=MyQuestionsCallback(action="folder", folder="private").pack()
             )
-        if rejected_count > 0:
+        if public_count > 0:
             keyboard.button(
-                text=f"❌ Отклонённые ({rejected_count})",
-                callback_data=MyQuestionsCallback(action="folder", folder="rejected").pack()
+                text=f"📢 Опубликованные ({public_count})",
+                callback_data=MyQuestionsCallback(action="folder", folder="public").pack()
             )
+        # Rejected folder removed - users should not see rejected questions
 
         keyboard.button(
-            text=f"📁 Все вопросы ({len(questions)})",
+            text=f"📁 Все вопросы ({len(visible_questions)})",
             callback_data=MyQuestionsCallback(action="folder", folder="all").pack()
         )
         keyboard.button(text="❓ Задать новый вопрос", callback_data="ask_question")
@@ -388,18 +431,22 @@ async def my_questions_folder(callback: CallbackQuery, callback_data: MyQuestion
             limit=50
         )
 
+    # Filter out rejected questions first - users should not see them
+    visible_questions = [q for q in questions if q.status != QuestionStatus.REJECTED]
+
     # Filter by folder
     if folder == "pending":
-        filtered = [q for q in questions if q.status in [QuestionStatus.PENDING, QuestionStatus.IN_PROGRESS]]
+        filtered = [q for q in visible_questions if q.status in [QuestionStatus.PENDING, QuestionStatus.IN_PROGRESS]]
         folder_name = "⏳ Ожидают ответа"
-    elif folder == "answered":
-        filtered = [q for q in questions if q.status in [QuestionStatus.ANSWERED_PUBLIC, QuestionStatus.ANSWERED_PRIVATE]]
-        folder_name = "✅ Отвеченные"
-    elif folder == "rejected":
-        filtered = [q for q in questions if q.status == QuestionStatus.REJECTED]
-        folder_name = "❌ Отклонённые"
+    elif folder == "private":
+        filtered = [q for q in visible_questions if q.status == QuestionStatus.ANSWERED_PRIVATE]
+        folder_name = "✉️ Личные ответы"
+    elif folder == "public":
+        filtered = [q for q in visible_questions if q.status == QuestionStatus.ANSWERED_PUBLIC]
+        folder_name = "📢 Опубликованные"
     else:
-        filtered = questions
+        # "all" folder - show all visible questions (excluding rejected)
+        filtered = visible_questions
         folder_name = "📁 Все вопросы"
 
     if not filtered:
@@ -410,7 +457,7 @@ async def my_questions_folder(callback: CallbackQuery, callback_data: MyQuestion
             QuestionStatus.IN_PROGRESS: "✍️",
             QuestionStatus.ANSWERED_PUBLIC: "✅",
             QuestionStatus.ANSWERED_PRIVATE: "✅",
-            QuestionStatus.REJECTED: "❌",
+            # REJECTED status removed - users should not see it
         }
 
         lines = []
@@ -430,8 +477,9 @@ async def my_questions_folder(callback: CallbackQuery, callback_data: MyQuestion
 
     keyboard = InlineKeyboardBuilder()
 
-    # Add buttons to view individual questions (for answered ones)
-    if folder == "answered":
+    # Add buttons based on folder type
+    if folder == "private":
+        # For private answers - show view buttons
         for q in filtered[:5]:  # Max 5 view buttons
             preview = q.question_text[:20]
             if len(q.question_text) > 20:
@@ -440,6 +488,18 @@ async def my_questions_folder(callback: CallbackQuery, callback_data: MyQuestion
                 text=f"👁️ #{q.id}: {preview}",
                 callback_data=MyQuestionsCallback(action="view", question_id=q.id).pack()
             )
+    elif folder == "public":
+        # For public answers - show channel links
+        for q in filtered[:5]:  # Max 5 link buttons
+            if q.channel_post and q.channel_post.message_id:
+                preview = q.question_text[:15]
+                if len(q.question_text) > 15:
+                    preview += "..."
+                post_url = f"https://t.me/{config.CHANNEL_USERNAME}/{q.channel_post.message_id}"
+                keyboard.button(
+                    text=f"📢 #{q.channel_post.post_number}: {preview}",
+                    url=post_url
+                )
 
     keyboard.button(text="🔙 Назад к папкам", callback_data="my_questions")
     keyboard.button(text="❓ Задать вопрос", callback_data="ask_question")
@@ -457,7 +517,9 @@ async def view_my_question(callback: CallbackQuery, callback_data: MyQuestionsCa
     async with async_session() as session:
         question = await QuestionService.get_question(session, question_id)
 
-    if not question or question.user_id != callback.from_user.id:
+    # Check if question exists, belongs to user, and is not rejected
+    # Rejected questions should be invisible to users (security)
+    if not question or question.user_id != callback.from_user.id or question.status == QuestionStatus.REJECTED:
         await callback.answer("Вопрос не найден", show_alert=True)
         return
 
@@ -467,7 +529,7 @@ async def view_my_question(callback: CallbackQuery, callback_data: MyQuestionsCa
         QuestionStatus.IN_PROGRESS: "✍️ В работе",
         QuestionStatus.ANSWERED_PUBLIC: "✅ Отвечен (публично)",
         QuestionStatus.ANSWERED_PRIVATE: "✅ Отвечен (приватно)",
-        QuestionStatus.REJECTED: "❌ Отклонён",
+        # REJECTED status removed - users should not see rejected questions
     }
 
     text = f"""📝 Вопрос #{question.id}

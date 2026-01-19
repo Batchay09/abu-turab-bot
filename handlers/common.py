@@ -8,8 +8,10 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from config import config
 from database import async_session
 from services.user_service import UserService
+from services.question_service import QuestionService
 from templates.messages import Messages
 
 common_router = Router()
@@ -30,7 +32,13 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer(Messages.ERROR_BANNED)
             return
 
-    # Show welcome message with buttons
+    # Check if admin - show admin panel directly
+    if message.from_user.id in config.ADMIN_IDS:
+        from handlers.admin import show_admin_panel
+        await show_admin_panel(message, state)
+        return
+
+    # Show welcome message with buttons for regular users
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="❓ Задать вопрос", callback_data="ask_question")
     keyboard.button(text="📋 Мои вопросы", callback_data="my_questions")

@@ -9,7 +9,7 @@ from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from database.models import Question, QuestionStatus, User
+from database.models import Question, QuestionStatus, User, SelfAnsweredLog
 
 
 class QuestionService:
@@ -142,12 +142,26 @@ class QuestionService:
             )
             my_assigned = my_assigned_result.scalar() or 0
 
+        # Self-answered statistics (users who found answers via search)
+        self_answered_today_result = await session.execute(
+            select(func.count(SelfAnsweredLog.id))
+            .where(SelfAnsweredLog.created_at >= today)
+        )
+        self_answered_today = self_answered_today_result.scalar() or 0
+
+        total_self_answered_result = await session.execute(
+            select(func.count(SelfAnsweredLog.id))
+        )
+        total_self_answered = total_self_answered_result.scalar() or 0
+
         return {
             "pending": pending,
             "in_progress": in_progress,
             "answered_today": answered_today,
             "total_answered": total_answered,
             "my_assigned": my_assigned,
+            "self_answered_today": self_answered_today,
+            "total_self_answered": total_self_answered,
         }
 
     @staticmethod
@@ -218,9 +232,10 @@ class QuestionService:
         user_id: int,
         limit: int = 10
     ) -> list[Question]:
-        """Get user's submitted questions"""
+        """Get user's submitted questions with channel post info"""
         result = await session.execute(
             select(Question)
+            .options(selectinload(Question.channel_post))
             .where(Question.user_id == user_id)
             .order_by(Question.created_at.desc())
             .limit(limit)
@@ -233,5 +248,41 @@ class QuestionService:
         result = await session.execute(
             select(func.count(Question.id))
             .where(Question.status == QuestionStatus.PENDING)
+        )
+        return result.scalar() or 0
+
+    @staticmethod
+    async def log_self_answered(
+        session: AsyncSession,
+        user_id: int,
+        question_preview: str,
+        found_post_id: Optional[int] = None
+    ) -> SelfAnsweredLog:
+        """Log when a user found their answer via search"""
+        log = SelfAnsweredLog(
+            user_id=user_id,
+            question_preview=question_preview[:500],  # Limit preview length
+            found_post_id=found_post_id
+        )
+        session.add(log)
+        await session.commit()
+        return log
+
+    @staticmethod
+    async def get_self_answered_count(session: AsyncSession) -> int:
+        """Get total count of self-answered questions"""
+        result = await session.execute(
+            select(func.count(SelfAnsweredLog.id))
+        )
+        return result.scalar() or 0
+
+    @staticmethod
+    async def get_self_answered_today(session: AsyncSession) -> int:
+        """Get count of self-answered questions today"""
+        from datetime import date
+        today = date.today()
+        result = await session.execute(
+            select(func.count(SelfAnsweredLog.id))
+            .where(func.date(SelfAnsweredLog.created_at) == today)
         )
         return result.scalar() or 0
