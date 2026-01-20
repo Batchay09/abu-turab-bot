@@ -2,97 +2,111 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Обзор проекта
 
-Abu Turab is a Telegram Q&A bot for Islamic religious questions built with Python. Users submit questions, administrators review and answer them, and answered questions are published to a Telegram channel. The bot features semantic search using FAISS and sentence-transformers to find similar previously-answered questions.
+Abu Turab — Telegram-бот для приёма религиозных вопросов по исламу на Python. Пользователи задают вопросы, администраторы отвечают на них, ответы публикуются в Telegram-канал. Бот использует гибридный поиск (FAISS + BM25) для поиска похожих ранее отвеченных вопросов.
 
-**Language**: Russian (all user-facing text)
-**ML Model**: `sergeyzh/rubert-tiny-turbo` (312-dimensional Russian embeddings)
+**Язык интерфейса**: Русский (весь текст для пользователей)
+**ML-модель**: `sergeyzh/rubert-tiny-turbo` (312-мерные русскоязычные эмбеддинги)
 
-## Commands
+## Команды
 
 ```bash
-# Install dependencies
+# Установка зависимостей
 pip install -r requirements.txt
 
-# Run the bot
+# Запуск бота
 python bot.py
 
-# Index existing channel posts (ИНТЕРАКТИВНЫЙ - запускать вручную в терминале)
+# Индексация постов канала (ИНТЕРАКТИВНЫЙ - запускать вручную в терминале)
 # Требует ввод номера телефона и кода из Telegram
 python indexer.py
 
-# Import Q&A from Telegram Desktop JSON export
+# Импорт Q&A из JSON-экспорта Telegram Desktop
 python import_from_json.py /path/to/result.json
 ```
 
-## Environment Setup
+## Настройка окружения
 
-Copy `.env.example` to `.env` and configure:
-- `BOT_TOKEN` - from @BotFather
-- `CHANNEL_ID`, `CHANNEL_USERNAME` - target channel for publishing
-- `ADMIN_IDS` - comma-separated Telegram user IDs
-- `API_ID`, `API_HASH` - from my.telegram.org (only for indexer.py)
+Скопировать `.env.example` в `.env` и настроить:
+- `BOT_TOKEN` — от @BotFather
+- `CHANNEL_ID`, `CHANNEL_USERNAME` — канал для публикации ответов
+- `ADMIN_IDS` — ID администраторов через запятую
+- `API_ID`, `API_HASH` — от my.telegram.org (только для indexer.py)
 
-## Architecture
+## Архитектура
 
 ```
-bot.py              # Entry point - initializes DB, search engine, registers routers
-config.py           # Centralized configuration from environment variables
+bot.py              # Точка входа — инициализация БД, поиска, регистрация роутеров
+config.py           # Конфигурация из переменных окружения
 
 database/
-  models.py         # SQLAlchemy models: User, Question, ChannelPost, Tag
-  connection.py     # Async SQLite connection (aiosqlite)
+  models.py         # SQLAlchemy модели: User, Question, ChannelPost, Tag, SelfAnsweredLog
+  connection.py     # Асинхронное подключение к SQLite (aiosqlite)
 
 services/
-  search_engine.py  # FAISS-based semantic search (singleton pattern)
-  question_service.py # Question CRUD operations
-  channel_service.py  # Channel post publishing and formatting
-  tag_service.py      # Tag/category management
-  synonyms.py         # Islamic terminology synonym expansion
+  search_engine.py  # Гибридный поиск: FAISS семантика + BM25 ключевые слова (singleton)
+  question_service.py # CRUD операции с вопросами
+  channel_service.py  # Публикация и форматирование постов в канал
+  tag_service.py      # Управление тегами/категориями
+  tag_suggester.py    # Автоматическое предложение тегов по ключевым словам
+  user_service.py     # Регистрация пользователей и проверка прав
+  synonyms.py         # Расширение синонимов исламских терминов (100+ терминов)
 
 handlers/
-  common.py         # /start, /help, cancel, main menu
-  user.py           # Question submission flow with semantic search
-  admin.py          # Admin panel, queue management, answering workflow
+  common.py         # /start, /help, отмена, главное меню
+  user.py           # Флоу отправки вопроса с поиском похожих
+  admin.py          # Админ-панель, очередь, ответы на вопросы
 
 states/
-  states.py         # FSM states for multi-step conversations
+  states.py         # FSM состояния для многошаговых диалогов
 
 templates/
-  messages.py       # All bot message strings (Russian)
+  messages.py       # Все текстовые сообщения бота (на русском)
 
-data/               # Runtime data (auto-created)
-  bot.db            # SQLite database
-  faiss.index       # Vector search index
-  documents.json    # Document metadata for search
+data/               # Данные времени выполнения (создаются автоматически)
+  bot.db            # SQLite база данных
+  faiss_questions.index   # Эмбеддинги вопросов
+  faiss_answers.index     # Эмбеддинги ответов
+  faiss_combined.index    # Взвешенная комбинация (60% вопрос + 40% ответ)
+  documents.json    # Метаданные документов для поиска
 ```
 
-## Key Patterns
+## Система гибридного поиска
 
-- **FSM (Finite State Machine)**: aiogram FSM for multi-step conversations (question submission, admin answering)
-- **Service Layer**: Business logic in `services/`, handlers only coordinate
-- **Singleton Search Engine**: Global `search_engine` instance in `services/search_engine.py`
-- **Async Throughout**: All database and Telegram API calls use async/await
-- **CallbackData Classes**: Structured callback payloads for inline keyboards
+Поисковый движок комбинирует несколько методов:
+1. **Мульти-векторный FAISS**: Отдельные индексы для вопросов, ответов и взвешенной комбинации (предотвращает смещение в сторону длинных ответов)
+2. **BM25 поиск по ключевым словам**: Точное совпадение терминов с TF-IDF ранжированием
+3. **Расширение синонимов**: Автоматическое расширение запросов для исламских терминов (намаз→салят, закят→закат)
+4. **Reciprocal Rank Fusion (RRF)**: Объединяет семантические (30%) и ключевые (70%) результаты
 
-## Question Flow
+## Ключевые паттерны
 
-1. User submits question → semantic search shows similar existing answers
-2. Question saved with status `pending`
-3. Admin takes question (`in_progress`), writes answer, selects tags
-4. Admin chooses destination: private reply or channel publication
-5. Published posts get sequential numbers (#1, #2, etc.) and are indexed for search
+- **FSM (конечный автомат)**: aiogram FSM для многошаговых диалогов (отправка вопроса, ответ админа)
+- **Service Layer**: Бизнес-логика в `services/`, хендлеры только координируют
+- **Singleton Search Engine**: Глобальный экземпляр `search_engine` в `services/search_engine.py`
+- **Async везде**: Все операции с БД и Telegram API через async/await
+- **CallbackData классы**: Структурированные данные для inline-кнопок
 
-## Database Models
+## Флоу вопроса
 
-- **User**: Telegram users with `is_admin`, `is_banned` flags
-- **Question**: Status progression: `pending` → `in_progress` → `answered`/`rejected`
-- **ChannelPost**: Published Q&A with sequential `post_number`
-- **Tag**: 24 predefined Islamic categories (Pillars of Islam, Fiqh sections, Aqeedah, etc.)
+1. Пользователь задаёт вопрос → гибридный поиск показывает похожие ответы
+2. Если пользователь нашёл ответ через поиск → логируется как "self-answered" (аналитика)
+3. Иначе вопрос сохраняется со статусом `pending`
+4. Админ берёт вопрос (`in_progress`), пишет ответ, выбирает теги (авто-предложение)
+5. Админ выбирает назначение: личный ответ или публикация в канал
+6. Опубликованные посты получают порядковые номера (#1, #2, ...) и индексируются
 
-## Notes
+## Модели базы данных
 
-- Uses MemoryStorage for FSM; comment in `bot.py` notes Redis needed for multi-worker deployment
-- Search threshold configured in `config.py`: `SIMILARITY_THRESHOLD = 0.5`
-- Synonym expansion in `services/synonyms.py` improves search recall for Islamic terminology
+- **User**: Пользователи Telegram с флагами `is_admin`, `is_banned`
+- **Question**: Прогрессия статусов: `pending` → `in_progress` → `answered_public`/`answered_private`/`rejected`/`self_answered`
+- **ChannelPost**: Опубликованные Q&A с порядковым `post_number`
+- **Tag**: 24 предустановленных исламских категории (столпы ислама, разделы фикха, акыда и т.д.)
+- **SelfAnsweredLog**: Отслеживает когда пользователи находят ответы через поиск без участия админа
+
+## Примечания
+
+- Используется MemoryStorage для FSM; в `bot.py` есть комментарий о необходимости Redis для multi-worker деплоя
+- Порог поиска настраивается в `config.py`: `SIMILARITY_THRESHOLD = 0.65`
+- Расширение синонимов в `services/synonyms.py` покрывает 100+ исламских терминов с многоязычными альтернативами
